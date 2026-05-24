@@ -1,0 +1,254 @@
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
+import { eq, ilike, and, gte, lte, sql, asc, desc, or } from 'drizzle-orm';
+
+import { db }               from '../db/db';
+import { students }         from '../db/schema';
+import { CreateStudentDto } from './dto/create-student.dto';
+import { UpdateStudentDto } from './dto/update-student.dto';
+
+export interface QueryStudentsDto {
+  search?:     string;
+  department?: string;
+  status?:     string;
+  semester?:   string;
+  minGpa?:     string;
+  maxGpa?:     string;
+  isActive?:   string;
+  sortBy?:     string;
+  order?:      'asc' | 'desc';
+  page?:       string;
+  limit?:      string;
+}
+
+@Injectable()
+export class StudentsService {
+
+  // ── GET ALL ──────────────────────────────────────────────────────────────
+  async findAll(query: QueryStudentsDto) {
+    const {
+      search,
+      department,
+      status,
+      semester,
+      minGpa,
+      maxGpa,
+      isActive,
+      sortBy  = 'createdAt',
+      order   = 'desc',
+      page    = '1',
+      limit   = '10',
+    } = query;
+
+    const pageNum  = Math.max(1, parseInt(page,  10) || 1);
+    const limitNum = Math.min(100, parseInt(limit, 10) || 10);
+    const offset   = (pageNum - 1) * limitNum;
+
+    const conditions: any[] = [];
+
+    if (search) {
+      conditions.push(
+        or(
+          ilike(students.name,       `%${search}%`),
+          ilike(students.email,      `%${search}%`),
+          ilike(students.rollNumber, `%${search}%`),
+        ),
+      );
+    }
+    if (department) conditions.push(eq(students.department, department as any));
+    if (status)     conditions.push(eq(students.status,     status as any));
+    if (semester)   conditions.push(eq(students.semester,   parseInt(semester, 10)));
+    if (isActive !== undefined) {
+      conditions.push(eq(students.isActive, isActive === 'true'));
+    }
+    if (minGpa) conditions.push(gte(students.gpa, minGpa));
+    if (maxGpa) conditions.push(lte(students.gpa, maxGpa));
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const sortableColumns: Record<string, any> = {
+      id:         students.id,
+      name:       students.name,
+      gpa:        students.gpa,
+      semester:   students.semester,
+      department: students.department,
+      createdAt:  students.createdAt,
+    };
+    const sortCol  = sortableColumns[sortBy] ?? students.createdAt;
+    const orderFn  = order === 'asc' ? asc : desc;
+
+    const [data, countResult] = await Promise.all([
+      db
+        .select()
+        .from(students)
+        .where(where)
+        .orderBy(orderFn(sortCol))
+        .limit(limitNum)
+        .offset(offset),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(students)
+        .where(where),
+    ]);
+
+    const total = Number(countResult[0]?.count ?? 0);
+
+    return {
+      data,
+      pagination: {
+        total,
+        page:       pageNum,
+        limit:      limitNum,
+        totalPages: Math.ceil(total / limitNum),
+      },
+    };
+  }
+
+  // ── GET STATS ────────────────────────────────────────────────────────────
+  async getStats() {
+    const [total, active, graduated, inactive, avgGpaResult, bySemester] =
+      await Promise.all([
+        db.select({ count: sql<number>`count(*)` }).from(students),
+        db.select({ count: sql<number>`count(*)` })
+          .from(students).where(eq(students.status, 'active')),
+        db.select({ count: sql<number>`count(*)` })
+          .from(students).where(eq(students.status, 'graduated')),
+        db.select({ count: sql<number>`count(*)` })
+          .from(students).where(eq(students.status, 'inactive')),
+        db.select({ avg: sql<string>`round(avg(gpa::numeric), 2)` }).from(students),
+        db
+          .select({
+            semester: students.semester,
+            count:    sql<number>`count(*)`,
+          })
+          .from(students)
+          .groupBy(students.semester)
+          .orderBy(asc(students.semester)),
+      ]);
+
+    return {
+      total:      Number(total[0].count),
+      active:     Number(active[0].count),
+      graduated:  Number(graduated[0].count),
+      inactive:   Number(inactive[0].count),
+      averageGpa: avgGpaResult[0]?.avg ?? '0.00',
+      bySemester,
+    };
+  }
+
+  // ── GET ONE ──────────────────────────────────────────────────────────────
+  async findOne(id: number) {
+    const [student] = await db
+      .select()
+      .from(students)
+      .where(eq(students.id, id));
+
+    if (!student) {
+      throw new NotFoundException(`Student with ID ${id} not found`);
+    }
+    return student;
+  }
+
+  // ── CREATE ───────────────────────────────────────────────────────────────
+  async create(dto: CreateStudentDto) {
+    // Check duplicate email
+    const [existingEmail] = await db
+      .select()
+      .from(students)
+      .where(eq(students.email, dto.email));
+    if (existingEmail) {
+      throw new ConflictException(`Email "${dto.email}" is already registered`);
+    }
+
+    // Check duplicate roll number
+    const [existingRoll] = await db
+      .select()
+      .from(students)
+      .where(eq(students.rollNumber, dto.rollNumber));
+    if (existingRoll) {
+      throw new ConflictException(`Roll number "${dto.rollNumber}" already exists`);
+    }
+
+    const [created] = await db
+      .insert(students)
+      .values({
+        name:        dto.name,
+        email:       dto.email,
+        phone:       dto.phone,
+        rollNumber:  dto.rollNumber,
+        department:  dto.department as any,
+        semester:    dto.semester,
+        gpa:         dto.gpa ?? '0.00',
+        address:     dto.address,
+        status:      (dto.status ?? 'active') as any,
+        dateOfBirth: dto.dateOfBirth,
+      })
+      .returning();
+
+    return created;
+  }
+
+  // ── UPDATE ───────────────────────────────────────────────────────────────
+  async update(id: number, dto: UpdateStudentDto) {
+    await this.findOne(id); // throws 404 if not found
+
+    if (dto.email) {
+      const [existingEmail] = await db
+        .select()
+        .from(students)
+        .where(and(eq(students.email, dto.email), sql`id != ${id}`));
+      if (existingEmail) {
+        throw new ConflictException(`Email "${dto.email}" is already in use`);
+      }
+    }
+
+    if (dto.rollNumber) {
+      const [existingRoll] = await db
+        .select()
+        .from(students)
+        .where(and(eq(students.rollNumber, dto.rollNumber), sql`id != ${id}`));
+      if (existingRoll) {
+        throw new ConflictException(`Roll number "${dto.rollNumber}" is already in use`);
+      }
+    }
+
+    const updateData: Record<string, any> = {
+      updatedAt: new Date(),
+    };
+    if (dto.name        !== undefined) updateData.name        = dto.name;
+    if (dto.email       !== undefined) updateData.email       = dto.email;
+    if (dto.phone       !== undefined) updateData.phone       = dto.phone;
+    if (dto.rollNumber  !== undefined) updateData.rollNumber  = dto.rollNumber;
+    if (dto.department  !== undefined) updateData.department  = dto.department;
+    if (dto.semester    !== undefined) updateData.semester    = dto.semester;
+    if (dto.gpa         !== undefined) updateData.gpa         = dto.gpa;
+    if (dto.address     !== undefined) updateData.address     = dto.address;
+    if (dto.status      !== undefined) updateData.status      = dto.status;
+    if (dto.isActive    !== undefined) updateData.isActive    = dto.isActive;
+    if (dto.dateOfBirth !== undefined) updateData.dateOfBirth = dto.dateOfBirth;
+
+    const [updated] = await db
+      .update(students)
+      .set(updateData)
+      .where(eq(students.id, id))
+      .returning();
+
+    return updated;
+  }
+
+  // ── DELETE ───────────────────────────────────────────────────────────────
+  async remove(id: number) {
+    await this.findOne(id); // throws 404 if not found
+
+    const [deleted] = await db
+      .delete(students)
+      .where(eq(students.id, id))
+      .returning();
+
+    return { message: `Student "${deleted.name}" deleted successfully`, id };
+  }
+}
